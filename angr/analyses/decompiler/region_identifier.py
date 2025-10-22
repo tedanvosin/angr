@@ -8,7 +8,7 @@ import networkx
 
 import angr.ailment as ailment
 from angr.ailment import Block
-from angr.ailment.statement import ConditionalJump, Jump
+from angr.ailment.statement import ConditionalJump, Jump, Call
 from angr.ailment.expression import Const
 
 from angr.utils.graph import GraphUtils
@@ -256,7 +256,23 @@ class RegionIdentifier(Analysis):
             else:
                 break
 
+    def _find_control_dependent_node(self, graph: networkx.DiGraph, node: Block) -> Block | None:
+        """
+        Find the closest node A in graph on which the given `node` has a control dependency (i.e., node A determines if
+        `node` will be executed or not). Returns node A if it exists, or None if we cannot find one.
+        """
+        preds = list(graph.predecessors(node))
+        if len(preds) == 1 or (len(preds) == 2 and node in preds):
+            pred = next(iter(p for p in preds if p is not node))
+            succs = list(graph.successors(pred))
+            if len(succs) == 2 and pred not in succs:
+                return pred
+            return self._find_control_dependent_node(graph, pred)
+        # multiple predecessors or no predecessors
+        return None
+
     def _find_loop_headers(self, graph: networkx.DiGraph) -> list:
+        assert self._start_node is not None
         heads = list({t for _, t in dfs_back_edges(graph, self._start_node)})
         return self._sort_nodes(heads)
 
@@ -696,6 +712,30 @@ class RegionIdentifier(Analysis):
             # sanity check: there should be at least one end node
             l.critical("No end node is found in a supposedly acyclic graph. Is it really acyclic?")
             return False
+
+        # special case: we add virtual edges for jumpout sites and callout sites to the other successor of their
+        # control-dependent node.
+        if len(endnodes) > 1:
+            graph_copy = networkx.DiGraph(graph_copy)
+            for i, endnode in enumerate(
+                sorted(endnodes, key=lambda n: (n.addr, n.idx if getattr(n, "idx", None) is not None else -1))
+            ):
+                if isinstance(endnode, Block) and endnode.statements:
+                    last_stmt = endnode.statements[-1]
+                    if (
+                        isinstance(last_stmt, Call)
+                        and isinstance(last_stmt.target, Const)
+                        and self.kb.functions.contains_addr(last_stmt.target.value)
+                        and not self.kb.functions.get_by_addr(last_stmt.target.value).returning
+                    ):
+                        pred = self._find_control_dependent_node(graph_copy, endnode)
+                        if pred is not None:
+                            succs = list(graph_copy.successors(pred))
+                            if len(succs) == 2:
+                                other_succ = succs[0] if succs[1] is endnode else succs[1]
+                                graph_copy.add_edge(endnode, other_succ)
+                                endnodes[i] = None
+            endnodes = [n for n in endnodes if n is not None]
 
         add_dummy_endnode = False
         if len(endnodes) > 1:
